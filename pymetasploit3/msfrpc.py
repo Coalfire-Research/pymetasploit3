@@ -7,7 +7,9 @@ import uuid
 import time
 import re
 import random
+import msgpack
 import requests.packages.urllib3
+from retry import retry
 requests.packages.urllib3.disable_warnings()
 
 __all__ = [
@@ -125,6 +127,7 @@ class MsfRpcMethod(object):
     ModulePayloads = 'module.payloads'
     ModuleEncoders = 'module.encoders'
     ModuleNops = 'module.nops'
+    ModulePlatforms = 'module.platforms'
     ModulePost = 'module.post'
     ModuleInfo = 'module.info'
     ModuleCompatiblePayloads = 'module.compatible_payloads'
@@ -134,6 +137,10 @@ class MsfRpcMethod(object):
     ModuleExecute = 'module.execute'
     ModuleEncodeFormats = 'module.encode_formats'
     ModuleEncode = 'module.encode'
+    ModuleSearch = 'module.search'
+    ModuleCompatibleSessions = 'module.compatible_sessions'
+    ModuleCheck = 'module.check'
+    ModuleResults = 'module.results'
     PluginLoad = 'plugin.load'
     PluginUnload = 'plugin.unload'
     PluginLoaded = 'plugin.loaded'
@@ -187,10 +194,14 @@ class MsfRpcClient(object):
         self.host = kwargs.get('server', '127.0.0.1')
         self.ssl = kwargs.get('ssl', False)
         self.token = kwargs.get('token')
+        self.encoding = kwargs.get('encoding', 'utf-8')
         self.headers = {"Content-type": "binary/message-pack"}
-        self.login(kwargs.get('username', 'msf'), password)
+        if self.token is None:
+            self.login(kwargs.get('username', 'msf'), password)
 
-    def call(self, method, opts=[]):
+    def call(self, method, opts=None, is_raw=False):
+        if not isinstance(opts, list):
+            opts = []
         if method != 'auth.login':
             if self.token is None:
                 raise MsfAuthError("MsfRPC: Not Authenticated")
@@ -206,11 +217,18 @@ class MsfRpcClient(object):
         opts.insert(0, method)
         payload = encode(opts)
 
-        r = requests.post(url, data=payload, headers=self.headers, verify=False)
+        r = self.post_request(url, payload)
 
         opts[:] = []  # Clear opts list
 
-        return convert(decode(r.content))  # convert all keys/vals to utf8
+        if is_raw:
+            return r.content
+
+        return convert(decode(r.content), self.encoding)  # convert all keys/vals to utf8
+
+    @retry(tries=3, delay=1, backoff=2)
+    def post_request(self, url, payload):
+        return requests.post(url, data=payload, headers=self.headers, verify=False)
 
     def login(self, user, password):
         auth = self.call(MsfRpcMethod.AuthLogin, [user, password])
@@ -1145,6 +1163,15 @@ class JobManager(MsfManager):
         """
         return self.rpc.call(MsfRpcMethod.JobInfo, [jobid])
 
+    def info_by_uuid(self, uuid):
+        """
+        Get job information for a particular job by its UUID.
+
+        Mandatory Argument:
+        - uuid : the UUID of the job.
+        """
+        return self.rpc.call(MsfRpcMethod.ModuleResults, [uuid])
+    
 
 class CoreManager(MsfManager):
 
@@ -1261,6 +1288,13 @@ class MsfModule(object):
             if 'default' in self._moptions[o]:
                 self._runopts[o] = self._moptions[o]['default']
 
+        if mtype in ["auxiliary", "post"]:
+            d_act = self._info.get('default_action')
+            if d_act is not None:
+                act = 'ACTION'
+                self._moptions[act] = {"default": d_act}
+                self._runopts[act] = self._moptions[act]['default']
+
     @property
     def options(self):
         """
@@ -1363,6 +1397,20 @@ class MsfModule(object):
         for k in d:
             self[k] = d[k]
 
+    def payload_generate(self, **kwargs):
+        runopts = self.runoptions.copy()
+        if not isinstance(self, PayloadModule):
+            return None
+        data = self.rpc.call(MsfRpcMethod.ModuleExecute, [self.moduletype, self.modulename, runopts], True)
+        payload = decode(data)[str.encode('payload')]
+        if isinstance(payload, str):
+            return payload
+        try:
+            payload = decode(payload)
+        except (msgpack.exceptions.ExtraData, UnicodeDecodeError):
+            return payload
+        return payload
+
     def execute(self, **kwargs):
         """
         Executes the module with its run options as parameters.
@@ -1401,6 +1449,44 @@ class MsfModule(object):
                     raise TypeError("Expected type str or PayloadModule not '%s'" % type(kwargs['payload']).__name__)
 
         return self.rpc.call(MsfRpcMethod.ModuleExecute, [self.moduletype, self.modulename, runopts])
+
+    def check(self, **kwargs):
+        """
+        Executes the check module with its run options as parameters.
+
+        Optional Keyword Arguments:
+        - **kwargs : can contain any module options.
+        """
+        runopts = self.runoptions.copy()
+        if isinstance(self, ExploitModule):
+            payload = kwargs.get('payload')
+            runopts['TARGET'] = self.target
+            if 'DisablePayloadHandler' in runopts and runopts['DisablePayloadHandler']:
+                pass
+            elif payload is None:
+                runopts['DisablePayloadHandler'] = True
+            else:
+                if isinstance(payload, PayloadModule):
+                    if payload.modulename not in self.payloads:
+                        raise ValueError(
+                            'Invalid payload (%s) for given target (%d).' % (payload.modulename, self.target)
+                        )
+                    runopts['PAYLOAD'] = payload.modulename
+                    for k, v in payload.runoptions.items():
+                        if v is None or (isinstance(v, str) and not v):
+                            continue
+                        if k not in runopts or runopts[k] is None or \
+                                (isinstance(runopts[k], str) and not runopts[k]):
+                            runopts[k] = v
+                #                    runopts.update(payload.runoptions)
+                elif isinstance(payload, str):
+                    if payload not in self.payloads:
+                        raise ValueError('Invalid payload (%s) for given target (%d).' % (payload, self.target))
+                    runopts['PAYLOAD'] = payload
+                else:
+                    raise TypeError("Expected type str or PayloadModule not '%s'" % type(kwargs['payload']).__name__)
+
+        return self.rpc.call(MsfRpcMethod.ModuleCheck, [self.moduletype, self.modulename, runopts])
 
 
 class ExploitModule(MsfModule):
@@ -1455,6 +1541,7 @@ class PostModule(MsfModule):
         - post : the name of the post exploitation module.
         """
         super(PostModule, self).__init__(rpc, 'post', post)
+        self._action = self._info.get('default_action', "")
 
     @property
     def sessions(self):
@@ -1462,6 +1549,17 @@ class PostModule(MsfModule):
         A list of compatible shell/meterpreter sessions.
         """
         return self.rpc.compatiblesessions(self.modulename)
+
+    @property
+    def action(self):
+        return self._action
+
+    @action.setter
+    def action(self, action):
+        if action not in self.actions.values():
+            raise ValueError('Action must be one of %s' % repr(list(self.actions.values())))
+        self._action = action
+        self._runopts['ACTION'] = self._action
 
 
 class EncoderModule(MsfModule):
@@ -1488,6 +1586,18 @@ class AuxiliaryModule(MsfModule):
         - auxiliary : the name of the auxiliary module.
         """
         super(AuxiliaryModule, self).__init__(rpc, 'auxiliary', auxiliary)
+        self._action = self._info.get('default_action', "")
+
+    @property
+    def action(self):
+        return self._action
+
+    @action.setter
+    def action(self, action):
+        if action not in self.actions.values():
+            raise ValueError('Action must be one of %s' % repr(list(self.actions.values())))
+        self._action = action
+        self._runopts['ACTION'] = self._action
 
 
 class PayloadModule(MsfModule):
@@ -1530,6 +1640,41 @@ class ModuleManager(MsfManager):
         - **kwargs : the module's run options
         """
         return self.rpc.call(MsfRpcMethod.ModuleExecute, [modtype, modname, kwargs])
+
+    def search(self, match):
+        """
+        Search the module.
+
+        Mandatory Arguments:
+        - match : the keyword to find (e.g. 'http')
+        """
+        return self.rpc.call(MsfRpcMethod.ModuleSearch, [match])
+        
+    def compatible_sessions(self, mname):
+        """
+        Find Compatible session for specific modules.
+
+        Mandatory Arguments:
+        - mname : the target module name
+        """
+        return self.rpc.call(MsfRpcMethod.ModuleCompatibleSessions, [mname])
+    
+    def check(self, mtype, mname, **kwargs):
+        """
+        Runs the check method of a module.
+
+        Mandatory Arguments:
+        - mtype : Module type
+        - mname : Module name
+
+        Optional Keyword Arguments:
+        - **kwargs : the module's run options
+        """
+        return self.rpc.call(MsfRpcMethod.ModuleCheck, [mtype, mname, kwargs])
+
+    def results(self, uuid):
+        return self.rpc.call(MsfRpcMethod.ModuleResults, [uuid])
+
 
     @property
     def exploits(self):
@@ -1586,6 +1731,13 @@ class ModuleManager(MsfManager):
         A list of nop modules.
         """
         return self.rpc.call(MsfRpcMethod.ModuleNops)['modules']
+
+    @property
+    def platforms(self):
+        """
+        A list of platform names.
+        """
+        return self.rpc.call(MsfRpcMethod.ModulePlatforms)
 
     def use(self, mtype, mname):
         """
@@ -1753,7 +1905,7 @@ class MeterpreterSession(MsfSession):
         else:
             out = self.runsingle(cmd)
         time.sleep(1)
-        out += self.gather_output(cmd, out, end_strs, timeout, timeout_exception) # gather last of data buffer
+        out += self.gather_output(cmd, out, end_strs, timeout, timeout_exception)  # gather last of data buffer
         return out
 
     def gather_output(self, cmd, out, end_strs, timeout, timeout_exception):
@@ -1780,7 +1932,7 @@ class MeterpreterSession(MsfSession):
         else:
             return out
 
-    def run_shell_cmd_with_output(self, cmd, end_strs, exit_shell=True):
+    def run_shell_cmd_with_output(self, cmd, end_strs, exit_shell=True, timeout=301, timeout_exception=True):
         """
         Runs a Windows command from a meterpreter shell
 
@@ -1788,9 +1940,9 @@ class MeterpreterSession(MsfSession):
         exit_shell : Exit the shell inside meterpreter once command is done.
         """
         self.start_shell()
-        out = self.run_with_output(cmd, end_strs)
+        out = self.run_with_output(cmd, end_strs, timeout=timeout, timeout_exception=timeout_exception)
         if exit_shell == True:
-            self.read() # Clear buffer
+            self.read()  # Clear buffer
             res = self.detach()
             if 'result' in res:
                 if res['result'] != 'success':
@@ -1953,7 +2105,7 @@ class SessionManager(MsfManager):
         """
         A list of active sessions.
         """
-        return {str(k): v for k, v in self.rpc.call(MsfRpcMethod.SessionList).items()} # Convert int id to str
+        return {str(k): v for k, v in self.rpc.call(MsfRpcMethod.SessionList).items()}  # Convert int id to str
 
     def session(self, sid):
         """
@@ -1966,10 +2118,10 @@ class SessionManager(MsfManager):
         if sid not in s:
             for k in s:
                 if s[k]['uuid'] == sid:
-                    if s[sid]['type'] == 'meterpreter':
-                        return MeterpreterSession(sid, self.rpc, s)
-                    elif s[sid]['type'] == 'shell':
-                        return ShellSession(sid, self.rpc, s)
+                    if s[k]['type'] == 'meterpreter':
+                        return MeterpreterSession(k, self.rpc, s)
+                    elif s[k]['type'] == 'shell':
+                        return ShellSession(k, self.rpc, s)
             raise KeyError('Session ID (%s) does not exist' % sid)
         if s[sid]['type'] == 'meterpreter':
             return MeterpreterSession(sid, self.rpc, s)
@@ -2051,34 +2203,57 @@ class MsfConsole(object):
             if c['id'] == self.cid:
                 return c['busy']
 
-    def run_module_with_output(self, mod, payload=None):
+    def run_module_with_output(self, mod, payload=None, run_as_job=False):
         """
         Execute a module and wait for the returned data
 
         Mandatory Arguments:
-        - cid : the console identifier.
-        - mod : the ModuleManager object
+        - mod : the MsfModule object
+
+        Optional Keyword Arguments:
+        - payload : the MsfModule object to be used as payload
         """
         options_str = 'use {}/{}\n'.format(mod.moduletype, mod.modulename)
         if self.rpc.consoles.console(self.cid).is_busy():
-            raise MsfError('Console %s is busy' % self.cid)
-        self.rpc.consoles.console(self.cid).read() # clear data buffer
-        opts = mod.runoptions
+            raise MsfError('Console {} is busy'.format(self.cid))
+        self.rpc.consoles.console(self.cid).read()  # clear data buffer
+        opts = mod.runoptions.copy()
+        if payload is None:
+            opts['DisablePayloadHandler'] = True
+
+        # Set module params
         for k in opts.keys():
             options_str += 'set {} {}\n'.format(k, opts[k])
+
+        # Set payload params
         if mod.moduletype == 'exploit':
-            if payload:
-                options_str += 'set payload {}\n'.format(payload)
-        options_str += 'run'
+            opts['TARGET'] = mod.target
+            options_str += 'set TARGET {}\n'.format(mod.target)
+
+            if 'DisablePayloadHandler' in opts and opts['DisablePayloadHandler']:
+                pass
+            elif isinstance(payload, PayloadModule):
+                if payload.modulename not in mod.payloads:
+                    raise ValueError(
+                        'Invalid payload ({}) for given target ({}).'.format(payload.modulename, mod.target))
+                options_str += 'set payload {}\n'.format(payload.modulename)
+                for k, v in payload.runoptions.items():
+                    if v is None or (isinstance(v, str) and not v):
+                        continue
+                    options_str += 'set {} {}\n'.format(k, v)
+            else:
+                raise ValueError('No valid PayloadModule provided for exploit execution.')
+
+        # Run the module without directly opening a command line
+        options_str += 'run -z'
+        if run_as_job:
+            options_str += " -j"
         self.rpc.consoles.console(self.cid).write(options_str)
-        # Sometimes it takes a while for the console to write all the options
-        # While it's writing the options the console will not be busy
-        while not self.rpc.consoles.console(self.cid).is_busy():
-            time.sleep(.5)
-        # After it's done writing all the options then the console will turn busy as the module runs
-        while self.rpc.consoles.console(self.cid).is_busy():
+        data = ''
+        while data == '' or self.rpc.consoles.console(self.cid).is_busy():
             time.sleep(1)
-        return self.rpc.consoles.console(self.cid).read()['data']
+            data += self.rpc.consoles.console(self.cid).read()['data']
+        return data
 
 
 class ConsoleManager(MsfManager):
@@ -2113,5 +2288,3 @@ class ConsoleManager(MsfManager):
         - cid : the console identifier.
         """
         self.rpc.call(MsfRpcMethod.ConsoleDestroy, [cid])
-
-

